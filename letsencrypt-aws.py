@@ -558,7 +558,7 @@ def cli():
         "a listener."
     )
 )
-def update_certificates(persistent=False, force_issue=False):
+def update_certificates(persistent=False, force_issue=False, cert_only=False):
     logger = Logger()
     logger.emit("startup")
 
@@ -626,8 +626,8 @@ def update_certificates(persistent=False, force_issue=False):
     else:
         logger.emit("running", mode="single")
         update_certs(
-            logger, acme_client,
-            force_issue, certificate_requests
+            logger, acme_client, force_issue, cert_only,
+            certificate_requests
         )
 
 
