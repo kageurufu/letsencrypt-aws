@@ -544,7 +544,7 @@ def get_config(config_path=None):
     # We need to find the JSON data, and return a dict
     if not config_path:
         env_var = os.environ.get("LETSENCRYPT_AWS_CONFIG")
-        if os.path.exists(env_var):
+        if env_var and os.path.exists(env_var):
             config_path = env_var
         elif env_var:
             print("Using env_var")
