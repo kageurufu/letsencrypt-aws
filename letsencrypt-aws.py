@@ -1,4 +1,5 @@
 import datetime
+import inspect
 import json
 import os
 import sys
@@ -537,12 +538,43 @@ def acme_client_for_private_key(acme_directory_url, private_key):
     )
 
 
+def get_config(config_path=None):
+    logger = Logger()
+
+    # We need to find the JSON data, and return a dict
+    if not config_path:
+        env_var = os.environ.get("LETSENCRYPT_AWS_CONFIG")
+        if os.path.exists(env_var):
+            config_path = env_var
+        elif env_var:
+            print("Using env_var")
+            return json.loads(env_var)
+        else:
+            script_filename = inspect.stack()[0][1]
+            script_path = os.path.dirname(os.path.abspath(script_filename))
+            config_path = os.path.join(script_path, 'config.json')
+    try:
+        if isinstance(config_path, file):
+            return json.load(config_path)
+        else:
+            with open(config_path, 'r') as config_file:
+                return json.load(config_file)
+    except IOError:
+        logger.emit("Configuration data could not be found")
+
+
 @click.group()
 def cli():
     pass
 
 
 @cli.command(name="update-certificates")
+@click.option(
+    '--config', type=click.File('rb'), help=(
+        "Specify the config file to use. If not specified, this defaults to"
+        " json data stored in the environment variable LETSENCRYPT_AWS_CONFIG"
+    )
+)
 @click.option(
     "--persistent", is_flag=True, help="Runs in a loop, instead of just once."
 )
@@ -558,7 +590,8 @@ def cli():
         "a listener."
     )
 )
-def update_certificates(persistent=False, force_issue=False, cert_only=False):
+def update_certificates(config=None, persistent=False, force_issue=False,
+                        cert_only=False):
     logger = Logger()
     logger.emit("startup")
 
@@ -573,7 +606,7 @@ def update_certificates(persistent=False, force_issue=False, cert_only=False):
     route53_client = session.client("route53")
     iam_client = session.client("iam")
 
-    config = json.loads(os.environ["LETSENCRYPT_AWS_CONFIG"])
+    config = get_config(config)
     domains = config["domains"]
     acme_directory_url = config.get(
         "acme_directory_url", DEFAULT_ACME_DIRECTORY_URL
