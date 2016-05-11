@@ -4,23 +4,17 @@ import os
 import sys
 import time
 
+import OpenSSL.crypto
 import acme.challenges
 import acme.client
 import acme.jose
-
+import boto3
 import click
-
+import rfc3986
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, rsa
-
-import boto3
-
-import OpenSSL.crypto
-
-import rfc3986
-
 
 DEFAULT_ACME_DIRECTORY_URL = "https://acme-v01.api.letsencrypt.org/directory"
 CERTIFICATE_EXPIRATION_THRESHOLD = datetime.timedelta(days=45)
@@ -54,42 +48,16 @@ class CertificateRequest(object):
         self.key_type = key_type
 
 
-class ELBCertificate(object):
-    def __init__(self, elb_client, iam_client, elb_name, elb_port):
-        self.elb_client = elb_client
+class AWSCertificate(object):
+    def __init__(self, iam_client, client, name, port=443):
         self.iam_client = iam_client
-        self.elb_name = elb_name
-        self.elb_port = elb_port
+        self.client = client
+        self.name = name
+        self.port = port
 
-    def get_current_certificate(self):
-        response = self.elb_client.describe_load_balancers(
-            LoadBalancerNames=[self.elb_name]
-        )
-        [description] = response["LoadBalancerDescriptions"]
-        [certificate_id] = [
-            listener["Listener"]["SSLCertificateId"]
-            for listener in description["ListenerDescriptions"]
-            if listener["Listener"]["LoadBalancerPort"] == self.elb_port
-        ]
-
-        paginator = self.iam_client.get_paginator("list_server_certificates")
-        for page in paginator.paginate():
-            for server_certificate in page["ServerCertificateMetadataList"]:
-                if server_certificate["Arn"] == certificate_id:
-                    cert_name = server_certificate["ServerCertificateName"]
-                    response = self.iam_client.get_server_certificate(
-                        ServerCertificateName=cert_name,
-                    )
-                    return x509.load_pem_x509_certificate(
-                        response["ServerCertificate"]["CertificateBody"],
-                        default_backend(),
-                    )
-
-    def update_certificate(self, logger, hosts, private_key, pem_certificate,
+    def upload_certificate(self, logger, hosts, private_key, pem_certificate,
                            pem_certificate_chain):
-        logger.emit(
-            "updating-elb.upload-iam-certificate", elb_name=self.elb_name
-        )
+        logger.emit("updating.upload-iam-certificate", name=self.name)
 
         response = self.iam_client.upload_server_certificate(
             ServerCertificateName=generate_certificate_name(
@@ -106,16 +74,124 @@ class ELBCertificate(object):
             CertificateBody=pem_certificate,
             CertificateChain=pem_certificate_chain,
         )
-        new_cert_arn = response["ServerCertificateMetadata"]["Arn"]
 
-        # Sleep before trying to set the certificate, it appears to sometimes
-        # fail without this.
-        time.sleep(15)
-        logger.emit("updating-elb.set-elb-certificate", elb_name=self.elb_name)
-        self.elb_client.set_load_balancer_listener_ssl_certificate(
-            LoadBalancerName=self.elb_name,
+        new_cert_arn = response["ServerCertificateMetadata"]["Arn"]
+        return new_cert_arn
+
+    def get_certificate(self, certificate_id):
+        paginator = self.iam_client.get_paginator("list_server_certificates")
+        for page in paginator.paginate():
+            for server_certificate in page["ServerCertificateMetadataList"]:
+                if server_certificate["Arn"] == certificate_id:
+                    cert_name = server_certificate["ServerCertificateName"]
+                    response = self.iam_client.get_server_certificate(
+                        ServerCertificateName=cert_name,
+                    )
+                    return x509.load_pem_x509_certificate(
+                        response["ServerCertificate"]["CertificateBody"],
+                        default_backend(),
+                    )
+
+    def update_certificate(self, logger, new_cert_arn):
+        raise NotImplementedError
+
+    def get_current_certificate(self):
+        raise NotImplementedError
+
+
+class ELBCertificate(AWSCertificate):
+    def get_current_certificate(self):
+        response = self.client.describe_load_balancers(
+            LoadBalancerNames=[self.name]
+        )
+        [description] = response["LoadBalancerDescriptions"]
+        [certificate_id] = [
+            listener["Listener"]["SSLCertificateId"]
+            for listener in description["ListenerDescriptions"]
+            if listener["Listener"]["LoadBalancerPort"] == self.port
+            ]
+
+        return self.get_certificate(certificate_id)
+
+    def update_certificate(self, logger, new_cert_arn):
+        logger.emit("updating-elb.set-elb-certificate", name=self.name)
+
+        self.client.set_load_balancer_listener_ssl_certificate(
+            LoadBalancerName=self.name,
             SSLCertificateId=new_cert_arn,
-            LoadBalancerPort=self.elb_port,
+            LoadBalancerPort=self.port,
+        )
+
+
+class CloudfrontCertificate(AWSCertificate):
+    def get_certificate(self, certificate_id):
+        response = self.client.get_distribution_config(Id=self.name)
+        cert = response["DistributionConfig"]["ViewerCertificate"]
+
+        assert cert.get("IAMCertificateId")
+        return self.get_certificate(cert['IAMCertificateId'])
+
+    def update_certificate(self, logger, new_cert_arn):
+        logger.emit(
+            "updating-cloudfront.set-cloudfront-certificate",
+            id=self.name
+        )
+
+        config = self.client.get_distribution_config(Id=self.name)
+
+        cert = config["DistributionConfig"]["ViewerCertificate"]
+        cert["IAMCertificateId"] = new_cert_arn
+
+        self.client.update_distribution(DistributionConfig=config)
+
+
+class ElasticBeanstalkCertificate(AWSCertificate):
+    def __init__(self, iam_client, client, environment, name, port=443):
+        AWSCertificate.__init__(self, iam_client, client, name, port)
+        self.environment = environment
+
+    @property
+    def namespace(self):
+        return "aws:elb:listener:{}".format(self.port)
+
+    def get_current_certificate(self):
+        response = self.client.describe_configuration_settings(
+            ApplicationName=self.name, EnvironmentName=self.environment
+        )
+
+        certificate_id = next((
+            option_setting["Value"]
+            for environment in response["ConfigurationSettings"]
+            for option_setting in environment["OptionSettings"]
+            if option_setting["Namespace"] == self.namespace
+            if option_setting["OptionName"] == "SSLCertificateId"
+        ), None)
+
+        if certificate_id:
+            return self.get_certificate(certificate_id)
+
+    def update_certificate(self, logger, new_cert_arn):
+        logger.emit(
+            "updating-beanstalk.set-beanstalk-certificate",
+            app_name=self.name, env_name=self.environment
+        )
+
+        # Update both possible namespaces for ensured compatibility
+        self.client.update_environment(
+            ApplicationName=self.name,
+            EnvironmentName=self.environment,
+            OptionSettings=[
+                {
+                    "Namespace": self.namespace,
+                    "OptionName": "SSLCertificateId",
+                    "Value": new_cert_arn
+                },
+                {
+                    "Namespace": 'aws:elb:loadbalancer',
+                    "OptionName": "SSLCertificateId",
+                    "Value": new_cert_arn
+                },
+            ]
         )
 
 
@@ -251,10 +327,8 @@ class AuthorizationRecord(object):
 
 
 def start_dns_challenge(logger, acme_client, dns_challenge_completer,
-                        elb_name, host):
-    logger.emit(
-        "updating-elb.request-acme-challenge", elb_name=elb_name, host=host
-    )
+                        name, host):
+    logger.emit("updating.request-acme-challenge", name=name, host=host)
     authz = acme_client.request_domain_challenges(
         host, acme_client.directory.new_authz
     )
@@ -262,7 +336,7 @@ def start_dns_challenge(logger, acme_client, dns_challenge_completer,
     [dns_challenge] = find_dns_challenge(authz)
 
     logger.emit(
-        "updating-elb.create-txt-record", elb_name=elb_name, host=host
+        "updating.create-txt-record", name=name, host=host
     )
     change_id = dns_challenge_completer.create_txt_record(
         dns_challenge.validation_domain_name(host),
@@ -278,18 +352,18 @@ def start_dns_challenge(logger, acme_client, dns_challenge_completer,
 
 
 def complete_dns_challenge(logger, acme_client, dns_challenge_completer,
-                           elb_name, authz_record):
+                           name, authz_record):
     logger.emit(
-        "updating-elb.wait-for-route53",
-        elb_name=elb_name, host=authz_record.host
+        "updating.wait-for-route53",
+        name=name, host=authz_record.host
     )
     dns_challenge_completer.wait_for_change(authz_record.change_id)
 
     response = authz_record.dns_challenge.response(acme_client.key)
 
     logger.emit(
-        "updating-elb.local-validation",
-        elb_name=elb_name, host=authz_record.host
+        "updating.local-validation",
+        name=name, host=authz_record.host
     )
     verified = response.simple_verify(
         authz_record.dns_challenge.chall,
@@ -300,14 +374,14 @@ def complete_dns_challenge(logger, acme_client, dns_challenge_completer,
         raise ValueError("Failed verification")
 
     logger.emit(
-        "updating-elb.answer-challenge",
-        elb_name=elb_name, host=authz_record.host
+        "updating.answer-challenge",
+        name=name, host=authz_record.host
     )
     acme_client.answer_challenge(authz_record.dns_challenge, response)
 
 
-def request_certificate(logger, acme_client, elb_name, authorizations, csr):
-    logger.emit("updating-elb.request-cert", elb_name=elb_name)
+def request_certificate(logger, acme_client, name, authorizations, csr):
+    logger.emit("updating.request-cert", name=name)
     cert_response, _ = acme_client.poll_and_request_issuance(
         acme.jose.util.ComparableX509(
             OpenSSL.crypto.load_certificate_request(
@@ -327,13 +401,13 @@ def request_certificate(logger, acme_client, elb_name, authorizations, csr):
     return pem_certificate, pem_certificate_chain
 
 
-def update_elb(logger, acme_client, force_issue, cert_request):
-    logger.emit("updating-elb", elb_name=cert_request.cert_location.elb_name)
+def update_aws(logger, acme_client, force_issue, cert_request, cert_only):
+    logger.emit("updating", name=cert_request.cert_location.name)
 
     current_cert = cert_request.cert_location.get_current_certificate()
     logger.emit(
-        "updating-elb.certificate-expiration",
-        elb_name=cert_request.cert_location.elb_name,
+        "updating.certificate-expiration",
+        name=cert_request.cert_location.name,
         expiration_date=current_cert.not_valid_after
     )
     days_until_expiration = (
@@ -375,30 +449,39 @@ def update_elb(logger, acme_client, force_issue, cert_request):
         for host in cert_request.hosts:
             authz_record = start_dns_challenge(
                 logger, acme_client, cert_request.dns_challenge_completer,
-                cert_request.cert_location.elb_name, host,
+                cert_request.cert_location.name, host,
             )
             authorizations.append(authz_record)
 
         for authz_record in authorizations:
             complete_dns_challenge(
                 logger, acme_client, cert_request.dns_challenge_completer,
-                cert_request.cert_location.elb_name, authz_record
+                cert_request.cert_location.name, authz_record
             )
 
         pem_certificate, pem_certificate_chain = request_certificate(
-            logger, acme_client, cert_request.cert_location.elb_name,
+            logger, acme_client, cert_request.cert_location.name,
             authorizations, csr
         )
 
-        cert_request.cert_location.update_certificate(
+        new_cert_arn = cert_request.cert_location.upload_certificate(
             logger, cert_request.hosts,
             private_key, pem_certificate, pem_certificate_chain
         )
+
+        if not cert_only:
+            # Sleep before trying to set the certificate, it appears to
+            # sometimes fail without this.
+            time.sleep(15)
+
+            cert_request.cert_location.update_certificate(
+                logger, new_cert_arn
+            )
     finally:
         for authz_record in authorizations:
             logger.emit(
-                "updating-elb.delete-txt-record",
-                elb_name=cert_request.cert_location.elb_name,
+                "updating.delete-txt-record",
+                name=cert_request.cert_location.name,
                 host=authz_record.host
             )
             dns_challenge = authz_record.dns_challenge
@@ -409,13 +492,15 @@ def update_elb(logger, acme_client, force_issue, cert_request):
             )
 
 
-def update_elbs(logger, acme_client, force_issue, certificate_requests):
+def update_certs(logger, acme_client, force_issue, cert_only,
+                 certificate_requests):
     for cert_request in certificate_requests:
-        update_elb(
+        update_aws(
             logger,
             acme_client,
             force_issue,
             cert_request,
+            cert_only,
         )
 
 
@@ -467,6 +552,12 @@ def cli():
         "expiration."
     )
 )
+@click.option(
+    '--cert-only', is_flag=True, help=(
+        "Only issue and upload a new certificate to IAM, without configuring "
+        "a listener."
+    )
+)
 def update_certificates(persistent=False, force_issue=False):
     logger = Logger()
     logger.emit("startup")
@@ -477,6 +568,8 @@ def update_certificates(persistent=False, force_issue=False):
     session = boto3.Session()
     s3_client = session.client("s3")
     elb_client = session.client("elb")
+    elasticbeanstalk_client = session.client("elasticbeanstalk")
+    cloudfront_client = session.client("cloudfront")
     route53_client = session.client("route53")
     iam_client = session.client("iam")
 
@@ -494,8 +587,19 @@ def update_certificates(persistent=False, force_issue=False):
     for domain in domains:
         if "elb" in domain:
             cert_location = ELBCertificate(
-                elb_client, iam_client,
+                iam_client, elb_client,
                 domain["elb"]["name"], int(domain["elb"].get("port", 443))
+            )
+        elif 'elasticbeanstalk' in domain:
+            cert_location = ElasticBeanstalkCertificate(
+                iam_client, elasticbeanstalk_client,
+                domain["elasticbeanstalk"]["environment"],
+                domain["elasticbeanstalk"]["name"]
+            )
+        elif 'cloudfront' in domain:
+            cert_location = CloudfrontCertificate(
+                iam_client, cloudfront_client,
+                domain["cloudfront"]["id"]
             )
         else:
             raise ValueError(
@@ -512,7 +616,7 @@ def update_certificates(persistent=False, force_issue=False):
     if persistent:
         logger.emit("running", mode="persistent")
         while True:
-            update_elbs(
+            update_certs(
                 logger, acme_client,
                 force_issue, certificate_requests
             )
@@ -521,7 +625,7 @@ def update_certificates(persistent=False, force_issue=False):
             time.sleep(PERSISTENT_SLEEP_INTERVAL)
     else:
         logger.emit("running", mode="single")
-        update_elbs(
+        update_certs(
             logger, acme_client,
             force_issue, certificate_requests
         )

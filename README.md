@@ -4,20 +4,24 @@
 automatically provisions and updates certificates on your AWS infrastructure
 using the AWS APIs and Let's Encrypt.
 
+`letsencrypt-aws` is currently capable of managing certificates for Elastic
+Load Balancer, Elastic Beanstalk, and CloudFront
+
 ## How it works
 
-`letsencrypt-aws` takes a list of ELBs, and which hosts you want them to be
-able to serve. It runs in a loop and every day does the following:
+`letsencrypt-aws` takes a list of domains, which hosts you want them to be
+able to serve, and the provider serving them. It runs in a loop and every day
+does the following:
 
-It gets the certificate for that ELB. If the certificate is going to expire
+It gets the certificate for that provider. If the certificate is going to expire
 soon (in less than 45 days), it generates a new private key and CSR and sends a
 request to Let's Encrypt. It takes the DNS challenge and creates a record in
 Route53 for that challenge. This completes the Let's Encrypt challenge and we
 receive a certificate. It uploads the new certificate and private key to IAM
-and updates your ELB to use the certificate.
+and updates your provider to use the certificate.
 
 In theory all you need to do is make sure this is running somewhere, and your
-ELBs' certificates will be kept minty fresh.
+Provider's certificates will be kept minty fresh.
 
 ## How to run it
 
@@ -57,6 +61,14 @@ environment variable. This should be a JSON object with the following schema:
                 "name": "ELB name (string)",
                 "port": "optional, defaults to 443 (integer)"
             },
+            "cloudfront": {
+                "id": "CloudFront distribution ID (string)"
+            },
+            "elasticbeanstalk": {
+                "name": "Application name (string)",
+                "environment": "Environment name (string",
+                "port": "optional, defaults to 443 (integer)"
+            },
             "hosts": ["list of hosts you want on the certificate (strings)"],
             "key_type": "rsa or ecdsa, optional, defaults to rsa (string)"
         }
@@ -65,6 +77,11 @@ environment variable. This should be a JSON object with the following schema:
     "acme_directory_url": "optional, defaults to Let's Encrypt production (string)"
 }
 ```
+
+Only one provider (`elb`, `cloudfront`, `elasticbeanstalk`) may currently be
+specified per domain, however hosts may be specified multiple times over
+different domains, to allow for configuration of a split system, including
+both CloudFront and Elastic Load Balancer.
 
 The `acme_account_key` can either be located on the local filesystem or in S3.
 To specify a local file you provide `"file:///path/to/key.pem"`, for S3 provide
@@ -79,6 +96,10 @@ useful for production environments.
 
 If your certificate is not expiring soon, but you need to issue a new one
 anyways, the `--force-issue` flag can be provided.
+
+If you need to issue certificates and upload to IAM, but your listeners are not
+ yet configured, or need manual intervention, the `--cert-only` flag should be
+ used.
 
 If you're into [Docker](https://www.docker.com/), there is an automatically
 built image of `letsencrypt-aws` available as
